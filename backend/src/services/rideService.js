@@ -1,264 +1,412 @@
-const { supabase } = require('../config/database');
-const { getFirebaseDB } = require('../config/firebase');
-const notificationService = require('./notificationService');
-const { logger } = require('../config/logger');
+const { query, getClient } = require('../config/database');
+const { getFirebaseDB, getMessaging } = require('../config/firebase');
+const logger = require('../config/logger');
+const socketService = require('./socketService');
 
-const MATCHING_RADIUS_KM = parseFloat(process.env.MATCHING_RADIUS_KM || 5);
-const DRIVER_ACCEPT_TIMEOUT = parseInt(process.env.DRIVER_ACCEPT_TIMEOUT_SECONDS || 30) * 1000;
+const MATCH_RADIUS_KM = parseFloat(process.env.MATCHING_RADIUS_KM) || 5;
+const DRIVER_TIMEOUT_MS = 30000; // 30 seconds per driver
 
-const requestRide = async (riderId, rideData) => {
-  const {
-    pickup_lat, pickup_lng, pickup_address,
-    destination_lat, destination_lng, destination_address,
-    payment_method, requested_driver_id
-  } = rideData;
-
-  const distance = haversine(pickup_lat, pickup_lng, destination_lat, destination_lng);
-  const estDuration = Math.round((distance / 30) * 60);
-
-  const { data: ride, error } = await supabase
-    .from('rides')
-    .insert({
-      rider_id: riderId,
-      pickup_lat, pickup_lng, pickup_address,
-      destination_lat, destination_lng, destination_address,
-      distance_km: distance.toFixed(2),
-      estimated_duration_mins: estDuration,
-      payment_method,
-      requested_driver_id,
-      status: 'matching'
-    })
-    .select()
-    .single();
-
-  if (error) throw error;
-
-  // Sync to Firebase for real-time
-  const db = getFirebaseDB();
-  if (db) {
-    await db.ref(`rides/${ride.id}`).set({
-      status: 'matching',
-      rider_id: riderId,
-      pickup: { lat: pickup_lat, lng: pickup_lng, address: pickup_address },
-      destination: { lat: destination_lat, lng: destination_lng, address: destination_address },
-      created_at: Date.now()
-    });
-  }
-
-  // Start matching process asynchronously
-  matchDriverToRide(ride).catch(err => logger.error('Matching error', { error: err.message, rideId: ride.id }));
-
-  return ride;
-};
-
-const matchDriverToRide = async (ride) => {
-  // Find nearby available drivers
-  const { data: drivers } = await supabase
-    .from('drivers')
-    .select(`
-      id, current_lat, current_lng,
-      user:users!user_id(id, full_name, fcm_token)
-    `)
-    .eq('is_online', true)
-    .eq('approval_status', 'approved')
-    .not('current_lat', 'is', null);
-
-  const nearby = (drivers || [])
-    .map(d => ({
-      ...d,
-      distance: haversine(ride.pickup_lat, ride.pickup_lng, d.current_lat, d.current_lng)
-    }))
-    .filter(d => d.distance <= MATCHING_RADIUS_KM)
-    .sort((a, b) => a.distance - b.distance);
-
-  if (nearby.length === 0) {
-    await supabase.from('rides').update({ status: 'no_driver_found' }).eq('id', ride.id);
-    const db = getFirebaseDB();
-    if (db) await db.ref(`rides/${ride.id}/status`).set('no_driver_found');
-    return;
-  }
-
-  // Try each driver in order until one accepts
-  for (const driver of nearby) {
-    const accepted = await offerRideToDriver(ride, driver);
-    if (accepted) return;
-  }
-
-  // No driver accepted
-  await supabase.from('rides').update({ status: 'no_driver_found' }).eq('id', ride.id);
-};
-
-const offerRideToDriver = async (ride, driver) => {
-  if (!driver.user?.fcm_token) return false;
-
-  await notificationService.sendPushNotification(driver.user.fcm_token, {
-    title: 'New Ride Request 🚗',
-    body: `Pickup: ${ride.pickup_address} → ${ride.destination_address}. ${ride.distance_km}km away.`,
-    data: { type: 'ride_request', ride_id: ride.id, driver_id: driver.id }
-  });
-
-  // Wait for driver response
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => resolve(false), DRIVER_ACCEPT_TIMEOUT);
-    const db = getFirebaseDB();
-    if (!db) { clearTimeout(timeout); return resolve(false); }
-
-    const ref = db.ref(`ride_responses/${ride.id}/${driver.id}`);
-    ref.on('value', async (snap) => {
-      const val = snap.val();
-      if (val === 'accepted') {
-        clearTimeout(timeout);
-        ref.off();
-        await assignDriverToRide(ride.id, driver.id);
-        resolve(true);
-      } else if (val === 'declined') {
-        clearTimeout(timeout);
-        ref.off();
-        resolve(false);
-      }
-    });
-  });
-};
-
-const assignDriverToRide = async (rideId, driverId) => {
-  const { data: ride } = await supabase
-    .from('rides')
-    .update({ driver_id: driverId, status: 'driver_assigned', matched_at: new Date().toISOString() })
-    .eq('id', rideId)
-    .select(`rider:users!rider_id(fcm_token, full_name)`)
-    .single();
-
-  const db = getFirebaseDB();
-  if (db) await db.ref(`rides/${rideId}/status`).set('driver_assigned');
-
-  if (ride?.rider?.fcm_token) {
-    await notificationService.sendPushNotification(ride.rider.fcm_token, {
-      title: 'Driver Found! 🎉',
-      body: 'Your driver is on the way.',
-      data: { type: 'driver_assigned', ride_id: rideId }
-    });
-  }
-};
-
-const acceptRide = async (rideId, driverUserId) => {
-  const { data: driver } = await supabase.from('drivers').select('id').eq('user_id', driverUserId).single();
-  const db = getFirebaseDB();
-  if (db) await db.ref(`ride_responses/${rideId}/${driver.id}`).set('accepted');
-  return { message: 'Ride accepted' };
-};
-
-const declineRide = async (rideId, driverUserId) => {
-  const { data: driver } = await supabase.from('drivers').select('id').eq('user_id', driverUserId).single();
-  const db = getFirebaseDB();
-  if (db) await db.ref(`ride_responses/${rideId}/${driver.id}`).set('declined');
-  return { message: 'Ride declined' };
-};
-
-const markArrived = async (rideId, driverUserId) => {
-  const { data: driver } = await supabase.from('drivers').select('id').eq('user_id', driverUserId).single();
-  const { data: ride } = await supabase
-    .from('rides')
-    .update({ status: 'arrived', driver_arrived_at: new Date().toISOString() })
-    .eq('id', rideId).eq('driver_id', driver.id)
-    .select('rider:users!rider_id(fcm_token)').single();
-  if (ride?.rider?.fcm_token) {
-    await notificationService.sendPushNotification(ride.rider.fcm_token, {
-      title: 'Driver Arrived 🚗',
-      body: 'Your driver is waiting at the pickup point.',
-      data: { type: 'driver_arrived', ride_id: rideId }
-    });
-  }
-  const db = getFirebaseDB();
-  if (db) await db.ref(`rides/${rideId}/status`).set('arrived');
-  return { message: 'Marked as arrived' };
-};
-
-const startRide = async (rideId, driverUserId) => {
-  const { data: driver } = await supabase.from('drivers').select('id').eq('user_id', driverUserId).single();
-  await supabase.from('rides')
-    .update({ status: 'in_progress', started_at: new Date().toISOString() })
-    .eq('id', rideId).eq('driver_id', driver.id);
-  const db = getFirebaseDB();
-  if (db) await db.ref(`rides/${rideId}/status`).set('in_progress');
-  return { message: 'Ride started' };
-};
-
-const completeRide = async (rideId, driverUserId, finalFare) => {
-  const { data: driver } = await supabase.from('drivers').select('id, total_rides, total_earnings').eq('user_id', driverUserId).single();
-  const { data: ride } = await supabase
-    .from('rides')
-    .update({
-      status: 'completed',
-      final_fare: finalFare,
-      payment_status: 'completed',
-      completed_at: new Date().toISOString()
-    })
-    .eq('id', rideId).eq('driver_id', driver.id)
-    .select('*').single();
-
-  // Update driver earnings
-  await supabase.from('drivers').update({
-    total_rides: driver.total_rides + 1,
-    total_earnings: parseFloat(driver.total_earnings) + parseFloat(finalFare)
-  }).eq('id', driver.id);
-
-  const db = getFirebaseDB();
-  if (db) {
-    await db.ref(`rides/${rideId}`).update({ status: 'completed', final_fare: finalFare });
-    await db.ref(`ride_responses/${rideId}`).remove();
-  }
-  return { message: 'Ride completed. Great job!', ride };
-};
-
-const cancelRide = async (rideId, user, reason) => {
-  const { data: ride } = await supabase.from('rides').select('*').eq('id', rideId).single();
-  if (!ride) throw Object.assign(new Error('Ride not found'), { statusCode: 404 });
-  if (['completed', 'cancelled'].includes(ride.status)) {
-    throw Object.assign(new Error('Cannot cancel this ride'), { statusCode: 400 });
-  }
-
-  const cancelledBy = user.role === 'driver' ? 'driver' : 'rider';
-  await supabase.from('rides').update({
-    status: 'cancelled',
-    cancelled_by: cancelledBy,
-    cancellation_reason: reason,
-    cancelled_at: new Date().toISOString()
-  }).eq('id', rideId);
-
-  const db = getFirebaseDB();
-  if (db) await db.ref(`rides/${rideId}/status`).set('cancelled');
-  return { message: 'Ride cancelled' };
-};
-
-const triggerSOS = async (rideId, userId) => {
-  const { data: ride } = await supabase.from('rides').select('*, rider:users!rider_id(emergency_contact, full_name)').eq('id', rideId).single();
-  if (!ride) throw Object.assign(new Error('Ride not found'), { statusCode: 404 });
-
-  await supabase.from('rides').update({
-    sos_triggered: true,
-    sos_triggered_at: new Date().toISOString()
-  }).eq('id', rideId);
-
-  logger.warn('SOS TRIGGERED', { rideId, userId, emergency_contact: ride.rider?.emergency_contact });
-
-  // SMS emergency contact
-  if (ride.rider?.emergency_contact) {
-    const smsService = require('./smsService');
-    await smsService.sendSMS(
-      ride.rider.emergency_contact,
-      `FAREWISE ALERT: ${ride.rider.full_name} has triggered an SOS during a ride. Last known trip: ${ride.pickup_address} to ${ride.destination_address}. Please call them immediately.`
-    );
-  }
-  return { message: 'SOS triggered. Emergency contact notified.', sos: true };
-};
-
-const haversine = (lat1, lng1, lat2, lng2) => {
+// Haversine distance in km
+function haversine(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
   const dLng = ((lng2 - lng1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-};
+}
 
-module.exports = { requestRide, acceptRide, declineRide, markArrived, startRide, completeRide, cancelRide, triggerSOS };
+async function requestRide(riderId, rideData) {
+  const {
+    pickup_address,
+    pickup_lat,
+    pickup_lng,
+    destination_address,
+    destination_lat,
+    destination_lng,
+    payment_method,
+    favourite_driver_id,
+    estimated_fare,
+    estimated_distance_km,
+  } = rideData;
+
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    const tripShareToken = require('crypto').randomBytes(16).toString('hex');
+
+    const result = await client.query(
+      `INSERT INTO rides (
+         rider_id, pickup_address, pickup_lat, pickup_lng,
+         destination_address, destination_lat, destination_lng,
+         payment_method, estimated_fare, estimated_distance_km,
+         trip_share_token, status
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'searching')
+       RETURNING *`,
+      [
+        riderId, pickup_address, pickup_lat, pickup_lng,
+        destination_address, destination_lat, destination_lng,
+        payment_method, estimated_fare, estimated_distance_km,
+        tripShareToken,
+      ]
+    );
+
+    const ride = result.rows[0];
+    await client.query('COMMIT');
+
+    // Sync to Firebase
+    const db = getFirebaseDB();
+    if (db) {
+      await db.ref(`rides/${ride.id}`).set({
+        status: 'searching',
+        rider_id: riderId,
+        pickup: { lat: pickup_lat, lng: pickup_lng, address: pickup_address },
+        destination: { lat: destination_lat, lng: destination_lng, address: destination_address },
+        created_at: Date.now(),
+      });
+    }
+
+    // Start matching asynchronously (don't await — respond immediately)
+    matchDriverToRide(ride, favourite_driver_id).catch(err =>
+      logger.error('Matching error', { rideId: ride.id, err: err.message })
+    );
+
+    return ride;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function matchDriverToRide(ride, favouriteDriverId) {
+  try {
+    // Build candidate list — favourite driver first if specified
+    let drivers = [];
+
+    if (favouriteDriverId) {
+      const favResult = await query(
+        `SELECT d.id, d.user_id, d.current_lat, d.current_lng, u.fcm_token, u.full_name
+         FROM drivers d
+         JOIN users u ON u.id = d.user_id
+         WHERE d.id = $1 AND d.is_online = true AND d.approval_status = 'approved'
+           AND d.current_lat IS NOT NULL`,
+        [favouriteDriverId]
+      );
+      if (favResult.rows.length > 0) {
+        drivers.push({ ...favResult.rows[0], distance: haversine(ride.pickup_lat, ride.pickup_lng, favResult.rows[0].current_lat, favResult.rows[0].current_lng) });
+      }
+    }
+
+    // Fill remaining candidates within radius
+    const nearbyResult = await query(
+      `SELECT d.id, d.user_id, d.current_lat, d.current_lng, u.fcm_token, u.full_name
+       FROM drivers d
+       JOIN users u ON u.id = d.user_id
+       LEFT JOIN subscriptions s ON s.driver_id = d.id AND s.status = 'active'
+       WHERE d.is_online = true
+         AND d.approval_status = 'approved'
+         AND d.current_lat IS NOT NULL
+         AND s.id IS NOT NULL
+         AND d.id != $1
+         AND d.current_ride_id IS NULL`,
+      [favouriteDriverId || '00000000-0000-0000-0000-000000000000']
+    );
+
+    const nearby = nearbyResult.rows
+      .map(d => ({ ...d, distance: haversine(ride.pickup_lat, ride.pickup_lng, d.current_lat, d.current_lng) }))
+      .filter(d => d.distance <= MATCH_RADIUS_KM)
+      .sort((a, b) => a.distance - b.distance);
+
+    drivers = [...drivers, ...nearby];
+
+    if (drivers.length === 0) {
+      await updateRideStatus(ride.id, 'no_driver_found');
+      notifyRider(ride.rider_id, 'ride:no_driver', { rideId: ride.id });
+      return;
+    }
+
+    // Try each driver sequentially
+    for (const driver of drivers) {
+      const accepted = await offerRideToDriver(ride, driver);
+      if (accepted) {
+        await assignDriverToRide(ride.id, driver);
+        return;
+      }
+    }
+
+    await updateRideStatus(ride.id, 'no_driver_found');
+    notifyRider(ride.rider_id, 'ride:no_driver', { rideId: ride.id });
+  } catch (err) {
+    logger.error('matchDriverToRide failed', { rideId: ride.id, err: err.message });
+    await updateRideStatus(ride.id, 'no_driver_found').catch(() => {});
+  }
+}
+
+async function offerRideToDriver(ride, driver) {
+  try {
+    // 1. Push via Socket.IO (instant if driver app is open)
+    socketService.broadcastRideRequest(driver.user_id, {
+      id: ride.id,
+      pickup_address: ride.pickup_address,
+      pickup_lat: ride.pickup_lat,
+      pickup_lng: ride.pickup_lng,
+      destination_address: ride.destination_address,
+      destination_lat: ride.destination_lat,
+      destination_lng: ride.destination_lng,
+      estimated_fare: ride.estimated_fare,
+      estimated_distance_km: ride.estimated_distance_km,
+      payment_method: ride.payment_method,
+      driver_distance_km: driver.distance,
+    });
+
+    // 2. FCM push notification (wakes app from background/killed state)
+    const messaging = getMessaging();
+    if (messaging && driver.fcm_token) {
+      await messaging.send({
+        token: driver.fcm_token,
+        data: {
+          type: 'ride_request',
+          ride_id: ride.id,
+          pickup: ride.pickup_address,
+          destination: ride.destination_address,
+          fare: String(ride.estimated_fare || ''),
+        },
+        notification: {
+          title: 'New Ride Request!',
+          body: `${ride.pickup_address} → ${ride.destination_address}`,
+        },
+        android: {
+          priority: 'high',
+          notification: { channelId: 'ride_requests', priority: 'max', defaultSound: true, defaultVibrateTimings: true },
+        },
+      }).catch(err => logger.warn('FCM send failed', { err: err.message }));
+    }
+
+    // 3. Write offer to Firebase and wait for response
+    const db = getFirebaseDB();
+    if (db) {
+      const responseRef = db.ref(`ride_responses/${ride.id}/${driver.id}`);
+      await responseRef.set('pending');
+
+      return await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          responseRef.off('value');
+          resolve(false); // timeout = no response = move to next driver
+        }, DRIVER_TIMEOUT_MS);
+
+        responseRef.on('value', (snap) => {
+          const val = snap.val();
+          if (val === 'accepted') {
+            clearTimeout(timer);
+            responseRef.off('value');
+            resolve(true);
+          } else if (val === 'declined') {
+            clearTimeout(timer);
+            responseRef.off('value');
+            resolve(false);
+          }
+          // 'pending' = still waiting
+        });
+      });
+    }
+
+    // Firebase not configured — fall back to a 30s wait (dev mode)
+    await new Promise(r => setTimeout(r, DRIVER_TIMEOUT_MS));
+    return false;
+  } catch (err) {
+    logger.error('offerRideToDriver error', { driverId: driver.id, err: err.message });
+    return false;
+  }
+}
+
+async function assignDriverToRide(rideId, driver) {
+  await query(
+    `UPDATE rides SET driver_id = $1, status = 'accepted', accepted_at = NOW() WHERE id = $2`,
+    [driver.user_id, rideId]
+  );
+  await query(
+    `UPDATE drivers SET current_ride_id = $1 WHERE id = $2`,
+    [rideId, driver.id]
+  );
+
+  const rideResult = await query('SELECT * FROM rides WHERE id = $1', [rideId]);
+  const ride = rideResult.rows[0];
+
+  const db = getFirebaseDB();
+  if (db) {
+    await db.ref(`rides/${rideId}`).update({
+      status: 'accepted',
+      driver_id: driver.user_id,
+      driver_name: driver.full_name,
+    });
+  }
+
+  // Notify rider
+  socketService.notifyUser(ride.rider_id, 'ride:accepted', {
+    rideId,
+    driver: { userId: driver.user_id, name: driver.full_name },
+  });
+}
+
+async function acceptRide(rideId, driverUserId) {
+  const driverResult = await query('SELECT id FROM drivers WHERE user_id = $1', [driverUserId]);
+  if (!driverResult.rows.length) throw new Error('Driver profile not found');
+  const driver = driverResult.rows[0];
+
+  const db = getFirebaseDB();
+  if (db) {
+    await db.ref(`ride_responses/${rideId}/${driver.id}`).set('accepted');
+  } else {
+    // Firebase not configured: directly assign
+    await assignDriverToRide(rideId, { ...driver, user_id: driverUserId });
+  }
+
+  return { success: true };
+}
+
+async function declineRide(rideId, driverUserId) {
+  const driverResult = await query('SELECT id FROM drivers WHERE user_id = $1', [driverUserId]);
+  if (!driverResult.rows.length) throw new Error('Driver profile not found');
+  const driver = driverResult.rows[0];
+
+  const db = getFirebaseDB();
+  if (db) {
+    await db.ref(`ride_responses/${rideId}/${driver.id}`).set('declined');
+  }
+  return { success: true };
+}
+
+async function cancelRide(rideId, userId) {
+  const result = await query(
+    `UPDATE rides SET status = 'cancelled', cancelled_at = NOW() WHERE id = $1
+     AND (rider_id = $2 OR driver_id = $2)
+     AND status NOT IN ('completed','cancelled')
+     RETURNING *`,
+    [rideId, userId]
+  );
+  if (!result.rows.length) throw new Error('Ride not found or cannot be cancelled');
+
+  const ride = result.rows[0];
+  if (ride.driver_id) {
+    await query('UPDATE drivers SET current_ride_id = NULL WHERE user_id = $1', [ride.driver_id]);
+    socketService.notifyUser(ride.driver_id, 'ride:cancelled', { rideId });
+  }
+  socketService.notifyUser(ride.rider_id, 'ride:cancelled', { rideId });
+
+  const db = getFirebaseDB();
+  if (db) await db.ref(`rides/${rideId}/status`).set('cancelled');
+
+  return ride;
+}
+
+async function markArrived(rideId, driverUserId) {
+  const result = await query(
+    `UPDATE rides SET status = 'arrived', arrived_at = NOW()
+     WHERE id = $1 AND driver_id = $2 AND status = 'accepted'
+     RETURNING *`,
+    [rideId, driverUserId]
+  );
+  if (!result.rows.length) throw new Error('Ride not in accepted state');
+  const ride = result.rows[0];
+  socketService.notifyUser(ride.rider_id, 'ride:driver_arrived', { rideId });
+  socketService.broadcastToRide(rideId, 'ride:status_update', { status: 'arrived' });
+  return ride;
+}
+
+async function startRide(rideId, driverUserId) {
+  const result = await query(
+    `UPDATE rides SET status = 'in_progress', started_at = NOW()
+     WHERE id = $1 AND driver_id = $2 AND status = 'arrived'
+     RETURNING *`,
+    [rideId, driverUserId]
+  );
+  if (!result.rows.length) throw new Error('Ride not in arrived state');
+  const ride = result.rows[0];
+  socketService.broadcastToRide(rideId, 'ride:status_update', { status: 'in_progress' });
+  return ride;
+}
+
+async function completeRide(rideId, driverUserId, actualFare) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    const result = await client.query(
+      `UPDATE rides SET status = 'completed', completed_at = NOW(), actual_fare = $1
+       WHERE id = $2 AND driver_id = $3 AND status = 'in_progress'
+       RETURNING *`,
+      [actualFare, rideId, driverUserId]
+    );
+    if (!result.rows.length) throw new Error('Cannot complete ride');
+
+    const ride = result.rows[0];
+
+    await client.query(
+      'UPDATE drivers SET current_ride_id = NULL WHERE user_id = $1',
+      [driverUserId]
+    );
+
+    await client.query('COMMIT');
+
+    socketService.notifyUser(ride.rider_id, 'ride:completed', { rideId, fare: actualFare });
+    socketService.broadcastToRide(rideId, 'ride:status_update', { status: 'completed', fare: actualFare });
+
+    const db = getFirebaseDB();
+    if (db) {
+      await db.ref(`rides/${rideId}`).update({ status: 'completed', actual_fare: actualFare });
+    }
+
+    return ride;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function triggerSOS(rideId, userId) {
+  const rideResult = await query('SELECT * FROM rides WHERE id = $1', [rideId]);
+  if (!rideResult.rows.length) throw new Error('Ride not found');
+  const ride = rideResult.rows[0];
+
+  // Log SOS in DB
+  await query(
+    `UPDATE rides SET metadata = COALESCE(metadata, '{}') || '{"sos_triggered": true}' WHERE id = $1`,
+    [rideId]
+  );
+
+  // Notify both parties and admin room
+  socketService.broadcastToRide(rideId, 'ride:sos', { rideId, triggeredBy: userId });
+  socketService.broadcastToDrivers('admin:sos_alert', { rideId, triggeredBy: userId });
+
+  return { sos: true, rideId };
+}
+
+async function updateRideStatus(rideId, status) {
+  await query('UPDATE rides SET status = $1 WHERE id = $2', [status, rideId]);
+  const db = getFirebaseDB();
+  if (db) await db.ref(`rides/${rideId}/status`).set(status);
+}
+
+function notifyRider(riderId, event, data) {
+  socketService.notifyUser(riderId, event, data);
+}
+
+module.exports = {
+  requestRide,
+  matchDriverToRide,
+  acceptRide,
+  declineRide,
+  cancelRide,
+  markArrived,
+  startRide,
+  completeRide,
+  triggerSOS,
+};

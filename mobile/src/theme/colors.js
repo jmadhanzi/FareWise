@@ -1,10 +1,8 @@
-export const colors = {
+const colors = {
   // Brand
-  primary: '#00A651',       // Zimbabwe green
+  primary: '#00A651',
   primaryDark: '#007A3D',
-  primaryLight: '#00D066',
-  accent: '#F5A623',        // Gold
-  accentDark: '#D4861A',
+  accent: '#F5A623',
 
   // Backgrounds
   bg: '#0D1117',
@@ -12,40 +10,24 @@ export const colors = {
   surfaceLight: '#21262D',
   card: '#1C2128',
 
+  // Borders
+  border: '#30363D',
+
   // Text
-  textPrimary: '#E6EDF3',
+  text: '#E6EDF3',
   textSecondary: '#8B949E',
-  textMuted: '#484F58',
-  textInverse: '#0D1117',
+  textMuted: '#6E7681',
 
   // Status
-  success: '#3FB950',
-  warning: '#D29922',
+  success: '#00A651',
+  warning: '#F5A623',
   error: '#F85149',
   info: '#58A6FF',
 
-  // Ride status colours
-  statusMatching: '#F5A623',
-  statusAssigned: '#58A6FF',
-  statusInProgress: '#00A651',
-  statusCompleted: '#3FB950',
-  statusCancelled: '#F85149',
-
-  // UI elements
-  border: '#30363D',
-  borderLight: '#21262D',
-  overlay: 'rgba(0, 0, 0, 0.6)',
-  mapOverlay: 'rgba(13, 17, 23, 0.85)',
-
-  // Driver app (green tint)
-  driverPrimary: '#00A651',
-  // Rider app (blue accent)
-  riderPrimary: '#58A6FF'
+  // Gradients (start/end pairs for LinearGradient)
+  gradientPrimary: ['#00A651', '#007A3D'],
+  gradientDark: ['#161B22', '#0D1117'],
+  gradientAccent: ['#F5A623', '#E8920E'],
 };
 
-export const gradients = {
-  primary: ['#00A651', '#007A3D'],
-  accent: ['#F5A623', '#D4861A'],
-  dark: ['#161B22', '#0D1117'],
-  card: ['#1C2128', '#161B22']
-};
+export default colors;
