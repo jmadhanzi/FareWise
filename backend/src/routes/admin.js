@@ -1,189 +1,279 @@
-const router = require('express').Router();
-const { body, query: qv, validationResult } = require('express-validator');
+const express = require('express');
+const router = express.Router();
+const { query } = require('../config/database');
 const { requireAdmin } = require('../middleware/auth');
 const { asyncHandler } = require('../middleware/errorHandler');
-const { supabase } = require('../config/database');
+const { body, query: qv, validationResult } = require('express-validator');
 
-const validate = (req, res, next) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-  next();
-};
+router.use(requireAdmin);
 
-// GET /api/v1/admin/dashboard
-router.get('/dashboard', ...requireAdmin, asyncHandler(async (req, res) => {
-  const [usersRes, driversRes, ridesRes, subsRes, revenueRes] = await Promise.all([
-    supabase.from('users').select('id, role', { count: 'exact', head: true }),
-    supabase.from('drivers').select('id, approval_status', { count: 'exact', head: false }),
-    supabase.from('rides').select('id, status, final_fare', { count: 'exact', head: false }),
-    supabase.from('subscriptions').select('id, status, amount_usd', { count: 'exact', head: false }),
-    supabase.from('payments').select('amount, status').eq('status', 'completed')
+// ── Dashboard ────────────────────────────────────────────────────────────────
+router.get('/dashboard', asyncHandler(async (req, res) => {
+  const [drivers, riders, rides, revenue, ridesByStatus, subsByPlan] = await Promise.all([
+    query('SELECT COUNT(*) FROM drivers'),
+    query("SELECT COUNT(*) FROM users WHERE role = 'rider'"),
+    query('SELECT COUNT(*) FROM rides'),
+    query("SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'paid'"),
+    query(`
+      SELECT status, COUNT(*) AS count FROM rides
+      GROUP BY status ORDER BY count DESC
+    `),
+    query(`
+      SELECT plan_type, COUNT(*) AS count,
+             SUM(amount_paid_usd) AS revenue
+      FROM subscriptions WHERE status = 'active'
+      GROUP BY plan_type
+    `),
   ]);
 
-  const drivers = driversRes.data || [];
-  const rides = ridesRes.data || [];
-  const subs = subsRes.data || [];
-  const revenue = revenueRes.data || [];
-
   res.json({
-    users: {
-      total: usersRes.count,
-      riders: (usersRes.data || []).filter(u => u.role === 'rider').length,
-      drivers: (usersRes.data || []).filter(u => u.role === 'driver').length
+    stats: {
+      total_drivers: parseInt(drivers.rows[0].count),
+      total_riders: parseInt(riders.rows[0].count),
+      total_rides: parseInt(rides.rows[0].count),
+      total_revenue_usd: parseFloat(revenue.rows[0].total),
     },
-    drivers: {
-      total: drivers.length,
-      pending: drivers.filter(d => d.approval_status === 'pending').length,
-      approved: drivers.filter(d => d.approval_status === 'approved').length,
-      rejected: drivers.filter(d => d.approval_status === 'rejected').length,
-      suspended: drivers.filter(d => d.approval_status === 'suspended').length
-    },
-    rides: {
-      total: rides.length,
-      completed: rides.filter(r => r.status === 'completed').length,
-      cancelled: rides.filter(r => r.status === 'cancelled').length,
-      active: rides.filter(r => ['driver_assigned', 'driver_en_route', 'arrived', 'in_progress'].includes(r.status)).length
-    },
-    subscriptions: {
-      total: subs.length,
-      active: subs.filter(s => s.status === 'active').length,
-      expired: subs.filter(s => s.status === 'expired').length,
-      monthly_revenue: subs.filter(s => s.status === 'active').reduce((sum, s) => sum + parseFloat(s.amount_usd || 0), 0).toFixed(2)
-    },
-    revenue: {
-      total_usd: revenue.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0).toFixed(2)
-    }
+    rides_by_status: ridesByStatus.rows,
+    subscriptions_by_plan: subsByPlan.rows,
   });
 }));
 
-// GET /api/v1/admin/drivers — list all drivers
-router.get('/drivers', ...requireAdmin,
-  [qv('status').optional().isIn(['pending', 'approved', 'rejected', 'suspended']),
-   qv('page').optional().isInt({ min: 1 }),
-   qv('limit').optional().isInt({ min: 1, max: 100 })],
-  validate,
-  asyncHandler(async (req, res) => {
-    const { status, page = 1, limit = 20, search } = req.query;
-    const offset = (page - 1) * limit;
-    let q = supabase.from('drivers')
-      .select(`*, user:users!user_id(full_name, phone, profile_photo_url, created_at)`, { count: 'exact' })
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-    if (status) q = q.eq('approval_status', status);
-    const { data, error, count } = await q;
-    if (error) throw error;
-    res.json({ drivers: data, total: count, page: +page, limit: +limit });
-  })
-);
+// ── Users (riders) ───────────────────────────────────────────────────────────
+router.get('/users', [
+  qv('role').optional().isIn(['rider', 'driver', 'admin']),
+  qv('search').optional().isString().trim(),
+  qv('page').optional().isInt({ min: 1 }).toInt(),
+  qv('limit').optional().isInt({ min: 1, max: 100 }).toInt(),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-// PUT /api/v1/admin/drivers/:id/approve
-router.put('/drivers/:id/approve', ...requireAdmin,
-  [body('action').isIn(['approved', 'rejected', 'suspended']),
-   body('notes').optional().trim()],
-  validate,
-  asyncHandler(async (req, res) => {
-    const { action, notes } = req.body;
-    const updates = {
-      approval_status: action,
-      approval_notes: notes,
-      approved_by: req.user.id
-    };
-    if (action === 'approved') updates.approved_at = new Date().toISOString();
-    const { data, error } = await supabase
-      .from('drivers').update(updates).eq('id', req.params.id).select().single();
-    if (error) throw error;
+  const role = req.query.role || 'rider';
+  const search = req.query.search || '';
+  const page = req.query.page || 1;
+  const limit = req.query.limit || 20;
+  const offset = (page - 1) * limit;
 
-    // Notify driver via FCM
-    const { data: driver } = await supabase
-      .from('drivers').select('user:users!user_id(fcm_token, full_name)').eq('id', req.params.id).single();
-    if (driver?.user?.fcm_token) {
-      const { sendPushNotification } = require('../services/notificationService');
-      const messages = {
-        approved: { title: 'Account Approved! 🎉', body: 'Your FareWise driver account is now active. Go online and start earning!' },
-        rejected: { title: 'Application Update', body: `Your driver application was not approved. ${notes || 'Contact support for details.'}` },
-        suspended: { title: 'Account Suspended', body: 'Your account has been suspended. Contact support.' }
-      };
-      await sendPushNotification(driver.user.fcm_token, messages[action]);
+  const searchParam = search ? `%${search}%` : null;
+
+  const usersResult = await query(
+    `SELECT
+       u.id, u.phone, u.full_name, u.role, u.is_active, u.created_at,
+       COUNT(r.id) AS total_rides,
+       COALESCE(SUM(r.actual_fare), 0) AS total_spent
+     FROM users u
+     LEFT JOIN rides r ON (
+       CASE WHEN u.role = 'rider' THEN r.rider_id = u.id
+            WHEN u.role = 'driver' THEN r.driver_id = u.id
+            ELSE FALSE END
+     ) AND r.status = 'completed'
+     WHERE u.role = $1
+       AND ($2::text IS NULL OR u.phone ILIKE $2 OR u.full_name ILIKE $2)
+     GROUP BY u.id
+     ORDER BY u.created_at DESC
+     LIMIT $3 OFFSET $4`,
+    [role, searchParam, limit, offset]
+  );
+
+  const countResult = await query(
+    `SELECT COUNT(*) FROM users
+     WHERE role = $1
+       AND ($2::text IS NULL OR phone ILIKE $2 OR full_name ILIKE $2)`,
+    [role, searchParam]
+  );
+
+  res.json({
+    users: usersResult.rows,
+    total: parseInt(countResult.rows[0].count),
+    page,
+    limit,
+    pages: Math.ceil(countResult.rows[0].count / limit),
+  });
+}));
+
+// ── Ban / unban user ─────────────────────────────────────────────────────────
+router.put('/users/:id/ban', [
+  body('is_active').isBoolean(),
+  body('reason').optional().isString().trim().isLength({ max: 500 }),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { is_active, reason } = req.body;
+  const { id } = req.params;
+
+  const result = await query(
+    'UPDATE users SET is_active = $1, updated_at = NOW() WHERE id = $2 RETURNING id, phone, full_name, is_active',
+    [is_active, id]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  res.json({
+    message: is_active ? 'User reactivated' : 'User banned',
+    user: result.rows[0],
+    reason,
+  });
+}));
+
+// ── Drivers ───────────────────────────────────────────────────────────────────
+router.get('/drivers', asyncHandler(async (req, res) => {
+  const status = req.query.status;
+  const params = [];
+  let where = '';
+  if (status) {
+    params.push(status);
+    where = `WHERE d.approval_status = $${params.length}`;
+  }
+
+  const result = await query(
+    `SELECT d.*, u.phone, u.full_name, u.is_active, u.created_at AS user_created_at,
+            s.status AS subscription_status, s.plan_type, s.expires_at
+     FROM drivers d
+     JOIN users u ON u.id = d.user_id
+     LEFT JOIN subscriptions s ON s.driver_id = d.id AND s.status = 'active'
+     ${where}
+     ORDER BY d.created_at DESC`,
+    params
+  );
+
+  res.json({ drivers: result.rows });
+}));
+
+router.put('/drivers/:id', [
+  body('approval_status').isIn(['approved', 'rejected', 'suspended']),
+  body('rejection_reason').optional().isString().trim().isLength({ max: 500 }),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { approval_status, rejection_reason } = req.body;
+  const { id } = req.params;
+
+  const result = await query(
+    `UPDATE drivers SET approval_status = $1, rejection_reason = $2, updated_at = NOW()
+     WHERE id = $3
+     RETURNING id, user_id, approval_status`,
+    [approval_status, rejection_reason || null, id]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: 'Driver not found' });
+  }
+
+  // Notify driver via FCM if approved
+  if (approval_status === 'approved') {
+    try {
+      const { getMessaging } = require('../config/firebase');
+      const messaging = getMessaging();
+      const tokenRes = await query(
+        'SELECT fcm_token FROM users WHERE id = $1 AND fcm_token IS NOT NULL',
+        [result.rows[0].user_id]
+      );
+      if (tokenRes.rows.length > 0 && messaging) {
+        await messaging.send({
+          token: tokenRes.rows[0].fcm_token,
+          notification: {
+            title: 'Account Approved! 🎉',
+            body: 'Your FareWise driver account has been approved. You can now go online and accept rides.',
+          },
+        });
+      }
+    } catch (_) {
+      // FCM failure is non-fatal
     }
-    res.json({ message: `Driver ${action}`, driver: data });
-  })
-);
+  }
 
-// GET /api/v1/admin/rides — list all rides
-router.get('/rides', ...requireAdmin, asyncHandler(async (req, res) => {
-  const { page = 1, limit = 20, status } = req.query;
-  const offset = (page - 1) * limit;
-  let q = supabase.from('rides')
-    .select(`
-      *, 
-      rider:users!rider_id(full_name, phone),
-      driver:drivers!driver_id(vehicle_plate, user:users!user_id(full_name))
-    `, { count: 'exact' })
-    .order('requested_at', { ascending: false })
-    .range(offset, offset + limit - 1);
-  if (status) q = q.eq('status', status);
-  const { data, error, count } = await q;
-  if (error) throw error;
-  res.json({ rides: data, total: count, page: +page, limit: +limit });
+  res.json({ driver: result.rows[0] });
 }));
 
-// GET /api/v1/admin/disputes
-router.get('/disputes', ...requireAdmin, asyncHandler(async (req, res) => {
-  const { status = 'open', page = 1, limit = 20 } = req.query;
+// ── Rides ─────────────────────────────────────────────────────────────────────
+router.get('/rides', asyncHandler(async (req, res) => {
+  const status = req.query.status;
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
   const offset = (page - 1) * limit;
-  const { data, error, count } = await supabase
-    .from('disputes')
-    .select(`*, raised_by_user:users!raised_by(full_name, phone), ride:rides(id, pickup_address, destination_address, final_fare)`, { count: 'exact' })
-    .eq('status', status)
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
-  if (error) throw error;
-  res.json({ disputes: data, total: count, page: +page, limit: +limit });
+
+  const params = [limit, offset];
+  let where = '';
+  if (status) {
+    params.push(status);
+    where = `WHERE r.status = $${params.length}`;
+  }
+
+  const result = await query(
+    `SELECT r.*,
+            ru.phone AS rider_phone, ru.full_name AS rider_name,
+            du.phone AS driver_phone, du.full_name AS driver_name
+     FROM rides r
+     JOIN users ru ON ru.id = r.rider_id
+     LEFT JOIN users du ON du.id = r.driver_id
+     ${where}
+     ORDER BY r.created_at DESC
+     LIMIT $1 OFFSET $2`,
+    params
+  );
+
+  const countResult = await query(
+    `SELECT COUNT(*) FROM rides r ${where}`,
+    status ? [status] : []
+  );
+
+  res.json({
+    rides: result.rows,
+    total: parseInt(countResult.rows[0].count),
+    page,
+    limit,
+  });
 }));
 
-// PUT /api/v1/admin/disputes/:id/resolve
-router.put('/disputes/:id/resolve', ...requireAdmin,
-  [body('resolution').trim().notEmpty()],
-  validate,
-  asyncHandler(async (req, res) => {
-    const { data, error } = await supabase
-      .from('disputes')
-      .update({
-        status: 'resolved',
-        resolution: req.body.resolution,
-        resolved_by: req.user.id,
-        resolved_at: new Date().toISOString()
-      })
-      .eq('id', req.params.id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json({ message: 'Dispute resolved', dispute: data });
-  })
-);
+// ── Disputes ──────────────────────────────────────────────────────────────────
+router.get('/disputes', asyncHandler(async (req, res) => {
+  const status = req.query.status || 'open';
+  const result = await query(
+    `SELECT d.*, r.pickup_address, r.destination_address, r.actual_fare,
+            ru.phone AS reporter_phone, ru.full_name AS reporter_name
+     FROM disputes d
+     JOIN rides r ON r.id = d.ride_id
+     JOIN users ru ON ru.id = d.reported_by
+     WHERE d.status = $1
+     ORDER BY d.created_at DESC`,
+    [status]
+  );
+  res.json({ disputes: result.rows });
+}));
 
-// PUT /api/v1/admin/users/:id/ban
-router.put('/users/:id/ban', ...requireAdmin,
-  [body('reason').trim().notEmpty()],
-  validate,
-  asyncHandler(async (req, res) => {
-    await supabase.from('users').update({ is_active: false }).eq('id', req.params.id);
-    res.json({ message: 'User banned' });
-  })
-);
+router.put('/disputes/:id', [
+  body('status').isIn(['resolved', 'dismissed']),
+  body('resolution').isString().trim().isLength({ min: 10, max: 1000 }),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-// GET /api/v1/admin/subscriptions
-router.get('/subscriptions', ...requireAdmin, asyncHandler(async (req, res) => {
-  const { status, page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
-  let q = supabase.from('subscriptions')
-    .select(`*, driver:drivers!driver_id(vehicle_plate, user:users!user_id(full_name, phone))`, { count: 'exact' })
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
-  if (status) q = q.eq('status', status);
-  const { data, error, count } = await q;
-  if (error) throw error;
-  res.json({ subscriptions: data, total: count, page: +page, limit: +limit });
+  const { status, resolution } = req.body;
+  const result = await query(
+    `UPDATE disputes SET status = $1, resolution = $2, resolved_by = $3, updated_at = NOW()
+     WHERE id = $4 RETURNING *`,
+    [status, resolution, req.user.id, req.params.id]
+  );
+
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Dispute not found' });
+  res.json({ dispute: result.rows[0] });
+}));
+
+// ── Subscriptions ─────────────────────────────────────────────────────────────
+router.get('/subscriptions', asyncHandler(async (req, res) => {
+  const result = await query(
+    `SELECT s.*, u.phone, u.full_name
+     FROM subscriptions s
+     JOIN drivers d ON d.id = s.driver_id
+     JOIN users u ON u.id = d.user_id
+     ORDER BY s.created_at DESC
+     LIMIT 100`
+  );
+  res.json({ subscriptions: result.rows });
 }));
 
 module.exports = router;
